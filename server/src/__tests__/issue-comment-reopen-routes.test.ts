@@ -503,6 +503,7 @@ describe("issue comment reopen routes", () => {
           priority: "high",
           assigneeAgentId: "ops-agent",
           assigneeUserId: null,
+          updatedAt: new Date("2000-01-01T00:00:00Z"),
         },
       ],
       blocks: [],
@@ -558,6 +559,7 @@ describe("issue comment reopen routes", () => {
           priority: "high",
           assigneeAgentId: "ops-agent",
           assigneeUserId: null,
+          updatedAt: new Date("2026-05-14T10:25:00Z"),
         },
       ],
       blocks: [],
@@ -579,6 +581,52 @@ describe("issue comment reopen routes", () => {
           commentId: "comment-1",
           mutation: "comment",
         }),
+      }),
+    );
+  });
+
+  it("keeps waking when mirrored blocked comments arrive after blocker state changes", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.listComments.mockResolvedValue([
+      {
+        id: "comment-prev-5",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+        body: "[WAITING-ON-HUMAN] Blocked on FMA-1209. Owner: Ops. Unblock: set DNS.",
+        createdAt: new Date("2026-05-14T10:20:00Z"),
+        updatedAt: new Date("2026-05-14T10:20:00Z"),
+        authorAgentId: null,
+        authorUserId: "local-board",
+      },
+    ]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          identifier: "FMA-1209",
+          title: "DNS pending",
+          status: "done",
+          priority: "high",
+          assigneeAgentId: "ops-agent",
+          assigneeUserId: null,
+          updatedAt: new Date("2026-05-14T10:25:00Z"),
+        },
+      ],
+      blocks: [],
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body: "[WAITING-ON-HUMAN] Blocked on FMA-1209. Owner: Ops. Unblock: set DNS.",
+      });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_commented",
       }),
     );
   });

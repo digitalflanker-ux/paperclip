@@ -112,6 +112,7 @@ export interface IssueRelationIssueSummary {
   priority: IssuePriority;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  updatedAt?: Date;
 }
 
 export interface IssueRelation {

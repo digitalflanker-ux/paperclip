@@ -164,19 +164,31 @@ function buildBlockedIssueFingerprint(
     .join("|");
 }
 
+function parseDateEpochMs(value: unknown) {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.getTime() : null;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 function evaluateBlockedIssueCommentWakeDedup(params: {
   issueStatus: string;
   issueId: string;
   assigneeAgentId: string | null;
   newCommentId: string;
   newCommentBody: string;
-  priorComments: Array<{ id: string; body: string }>;
+  priorComments: Array<{ id: string; body: string; createdAt: Date | string }>;
   blockedBy: Array<{
     id: string;
     identifier: string | null;
     status: string;
     assigneeAgentId: string | null;
     assigneeUserId: string | null;
+    updatedAt?: Date;
   }>;
 }) {
   if (params.issueStatus !== "blocked" || !params.assigneeAgentId) {
@@ -191,13 +203,23 @@ function evaluateBlockedIssueCommentWakeDedup(params: {
   const currentSig = buildWakeCommentSignature(params.newCommentBody);
   const previousSig = buildWakeCommentSignature(previous.body);
   const blockerFingerprint = buildBlockedIssueFingerprint(params.blockedBy);
+  const blockerFingerprintHash = createHash("sha256")
+    .update(blockerFingerprint)
+    .digest("hex");
   const fingerprintHash = createHash("sha256")
     .update(`${blockerFingerprint}|${currentSig.signature}`)
     .digest("hex");
+  const previousCommentTs = parseDateEpochMs(previous.createdAt);
+  const blockerFingerprintUnchanged = previousCommentTs === null
+    ? true
+    : !params.blockedBy.some((item) => {
+      const blockerUpdatedAt = parseDateEpochMs(item.updatedAt);
+      return blockerUpdatedAt !== null && blockerUpdatedAt > previousCommentTs;
+    });
 
   const equivalent = currentSig.signature === previousSig.signature;
   const hasNewEvidence = currentSig.hasEvidenceToken && !previousSig.hasEvidenceToken;
-  const suppress = equivalent && !hasNewEvidence;
+  const suppress = equivalent && !hasNewEvidence && blockerFingerprintUnchanged;
 
   return {
     checked: true as const,
@@ -206,6 +228,8 @@ function evaluateBlockedIssueCommentWakeDedup(params: {
     assigneeAgentId: params.assigneeAgentId,
     priorCommentId: previous.id,
     newCommentId: params.newCommentId,
+    blockerFingerprintHash,
+    blockerFingerprintUnchanged,
     fingerprintHash,
   };
 }
@@ -1986,13 +2010,14 @@ export function issueRoutes(
       existing.status === "blocked" &&
       !!existing.assigneeAgentId &&
       !reopened;
-    let priorCommentsForWakeDedup: Array<{ id: string; body: string }> = [];
+    let priorCommentsForWakeDedup: Array<{ id: string; body: string; createdAt: Date | string }> = [];
     let blockedByForWakeDedup: Array<{
       id: string;
       identifier: string | null;
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      updatedAt?: Date;
     }> = [];
     if (shouldCheckBlockedCommentDedup) {
       const [recentComments, relationSummary] = await Promise.all([
@@ -2002,6 +2027,7 @@ export function issueRoutes(
       priorCommentsForWakeDedup = recentComments.map((existingComment) => ({
         id: existingComment.id,
         body: existingComment.body,
+        createdAt: existingComment.createdAt,
       }));
       blockedByForWakeDedup = relationSummary.blockedBy;
     }
@@ -2141,6 +2167,8 @@ export function issueRoutes(
               assigneeAgentId: dedupDecision.assigneeAgentId,
               reason: "issue_commented",
               fingerprintHash: dedupDecision.fingerprintHash,
+              blockerFingerprintHash: dedupDecision.blockerFingerprintHash,
+              blockerFingerprintUnchanged: dedupDecision.blockerFingerprintUnchanged,
               priorCommentId: dedupDecision.priorCommentId,
               newCommentId: dedupDecision.newCommentId,
               suppressed: dedupDecision.suppress,
@@ -2155,6 +2183,8 @@ export function issueRoutes(
               assigneeAgentId: dedupDecision.assigneeAgentId,
               reason: "issue_commented",
               fingerprintHash: dedupDecision.fingerprintHash,
+              blockerFingerprintHash: dedupDecision.blockerFingerprintHash,
+              blockerFingerprintUnchanged: dedupDecision.blockerFingerprintUnchanged,
               priorCommentId: dedupDecision.priorCommentId,
               newCommentId: dedupDecision.newCommentId,
             },
@@ -2725,13 +2755,14 @@ export function issueRoutes(
       currentIssue.status === "blocked" &&
       !!currentIssue.assigneeAgentId &&
       !reopened;
-    let priorCommentsForWakeDedup: Array<{ id: string; body: string }> = [];
+    let priorCommentsForWakeDedup: Array<{ id: string; body: string; createdAt: Date | string }> = [];
     let blockedByForWakeDedup: Array<{
       id: string;
       identifier: string | null;
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      updatedAt?: Date;
     }> = [];
     if (shouldCheckBlockedCommentDedup) {
       const [recentComments, relationSummary] = await Promise.all([
@@ -2741,6 +2772,7 @@ export function issueRoutes(
       priorCommentsForWakeDedup = recentComments.map((existingComment) => ({
         id: existingComment.id,
         body: existingComment.body,
+        createdAt: existingComment.createdAt,
       }));
       blockedByForWakeDedup = relationSummary.blockedBy;
     }
@@ -2800,6 +2832,8 @@ export function issueRoutes(
             assigneeAgentId: dedupDecision.assigneeAgentId,
             reason: "issue_commented",
             fingerprintHash: dedupDecision.fingerprintHash,
+            blockerFingerprintHash: dedupDecision.blockerFingerprintHash,
+            blockerFingerprintUnchanged: dedupDecision.blockerFingerprintUnchanged,
             priorCommentId: dedupDecision.priorCommentId,
             newCommentId: dedupDecision.newCommentId,
             suppressed: dedupDecision.suppress,
@@ -2814,6 +2848,8 @@ export function issueRoutes(
             assigneeAgentId: dedupDecision.assigneeAgentId,
             reason: "issue_commented",
             fingerprintHash: dedupDecision.fingerprintHash,
+            blockerFingerprintHash: dedupDecision.blockerFingerprintHash,
+            blockerFingerprintUnchanged: dedupDecision.blockerFingerprintUnchanged,
             priorCommentId: dedupDecision.priorCommentId,
             newCommentId: dedupDecision.newCommentId,
           },
