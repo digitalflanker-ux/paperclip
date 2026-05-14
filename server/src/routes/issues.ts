@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -96,6 +96,119 @@ type ExecutionStageWakeContext = {
   lastDecisionOutcome: ParsedExecutionState["lastDecisionOutcome"];
   allowedActions: string[];
 };
+
+const WAKE_COMMENT_HINT_TERMS = [
+  "owner",
+  "unblock",
+  "waiting-on-human",
+  "blocked",
+  "todo",
+  "in_progress",
+  "in_review",
+  "done",
+] as const;
+
+const WAKE_COMMENT_EVIDENCE_PATTERN =
+  /\b(credentials?|access|token|api[_ -]?key|secret|password|invite|permission|dns|ssh|login)\b/i;
+
+function normalizeWakeCommentBody(body: string) {
+  return body
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, " ")
+    .replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z?\b/gi, " ")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractWakeCommentIssueTokens(body: string) {
+  const matches = body.toUpperCase().match(/\b[A-Z]{2,}-\d+\b/g) ?? [];
+  return [...new Set(matches)].sort();
+}
+
+function extractWakeCommentHintTokens(normalizedBody: string) {
+  const hints = WAKE_COMMENT_HINT_TERMS.filter((term) => normalizedBody.includes(term));
+  return [...new Set(hints)].sort();
+}
+
+function buildWakeCommentSignature(body: string) {
+  const normalized = normalizeWakeCommentBody(body);
+  const issueTokens = extractWakeCommentIssueTokens(body);
+  const hintTokens = extractWakeCommentHintTokens(normalized);
+  const signature = `${normalized}|issues:${issueTokens.join(",")}|hints:${hintTokens.join(",")}`;
+  return {
+    signature,
+    hasEvidenceToken: WAKE_COMMENT_EVIDENCE_PATTERN.test(normalized),
+  };
+}
+
+function buildBlockedIssueFingerprint(
+  blockedBy: Array<{
+    id: string;
+    identifier: string | null;
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+  }>,
+) {
+  if (blockedBy.length === 0) return "none";
+  return blockedBy
+    .map((item) =>
+      [
+        item.identifier ?? item.id,
+        item.status,
+        item.assigneeAgentId ?? "",
+        item.assigneeUserId ?? "",
+      ].join(":"))
+    .sort()
+    .join("|");
+}
+
+function evaluateBlockedIssueCommentWakeDedup(params: {
+  issueStatus: string;
+  issueId: string;
+  assigneeAgentId: string | null;
+  newCommentId: string;
+  newCommentBody: string;
+  priorComments: Array<{ id: string; body: string }>;
+  blockedBy: Array<{
+    id: string;
+    identifier: string | null;
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+  }>;
+}) {
+  if (params.issueStatus !== "blocked" || !params.assigneeAgentId) {
+    return { checked: false, suppress: false as const };
+  }
+
+  const previous = params.priorComments.find((comment) => comment.body.trim().length > 0);
+  if (!previous) {
+    return { checked: false, suppress: false as const };
+  }
+
+  const currentSig = buildWakeCommentSignature(params.newCommentBody);
+  const previousSig = buildWakeCommentSignature(previous.body);
+  const blockerFingerprint = buildBlockedIssueFingerprint(params.blockedBy);
+  const fingerprintHash = createHash("sha256")
+    .update(`${blockerFingerprint}|${currentSig.signature}`)
+    .digest("hex");
+
+  const equivalent = currentSig.signature === previousSig.signature;
+  const hasNewEvidence = currentSig.hasEvidenceToken && !previousSig.hasEvidenceToken;
+  const suppress = equivalent && !hasNewEvidence;
+
+  return {
+    checked: true as const,
+    suppress,
+    issueId: params.issueId,
+    assigneeAgentId: params.assigneeAgentId,
+    priorCommentId: previous.id,
+    newCommentId: params.newCommentId,
+    fingerprintHash,
+  };
+}
 
 function executionPrincipalsEqual(
   left: ParsedExecutionState["currentParticipant"] | null,
@@ -1868,6 +1981,31 @@ export function issueRoutes(
       }
     }
 
+    const shouldCheckBlockedCommentDedup =
+      !!commentBody &&
+      existing.status === "blocked" &&
+      !!existing.assigneeAgentId &&
+      !reopened;
+    let priorCommentsForWakeDedup: Array<{ id: string; body: string }> = [];
+    let blockedByForWakeDedup: Array<{
+      id: string;
+      identifier: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    }> = [];
+    if (shouldCheckBlockedCommentDedup) {
+      const [recentComments, relationSummary] = await Promise.all([
+        svc.listComments(id, { order: "desc", limit: 5 }),
+        svc.getRelationSummaries(id),
+      ]);
+      priorCommentsForWakeDedup = recentComments.map((existingComment) => ({
+        id: existingComment.id,
+        body: existingComment.body,
+      }));
+      blockedByForWakeDedup = relationSummary.blockedBy;
+    }
+
     let comment = null;
     if (commentBody) {
       comment = await svc.addComment(id, commentBody, {
@@ -1985,8 +2123,46 @@ export function issueRoutes(
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
         const skipAssigneeCommentWake = selfComment || isClosed;
+        const dedupDecision = !reopened
+          ? evaluateBlockedIssueCommentWakeDedup({
+            issueStatus: existing.status,
+            issueId: id,
+            assigneeAgentId: assigneeId,
+            newCommentId: comment.id,
+            newCommentBody: commentBody,
+            priorComments: priorCommentsForWakeDedup,
+            blockedBy: blockedByForWakeDedup,
+          })
+          : { checked: false, suppress: false as const };
+        if (dedupDecision.checked) {
+          logger.info(
+            {
+              issueId: dedupDecision.issueId,
+              assigneeAgentId: dedupDecision.assigneeAgentId,
+              reason: "issue_commented",
+              fingerprintHash: dedupDecision.fingerprintHash,
+              priorCommentId: dedupDecision.priorCommentId,
+              newCommentId: dedupDecision.newCommentId,
+              suppressed: dedupDecision.suppress,
+            },
+            "wake_comment_dedup_checked",
+          );
+        }
+        if (dedupDecision.suppress) {
+          logger.info(
+            {
+              issueId: dedupDecision.issueId,
+              assigneeAgentId: dedupDecision.assigneeAgentId,
+              reason: "issue_commented",
+              fingerprintHash: dedupDecision.fingerprintHash,
+              priorCommentId: dedupDecision.priorCommentId,
+              newCommentId: dedupDecision.newCommentId,
+            },
+            "wake_suppressed_duplicate_comment",
+          );
+        }
 
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        if (assigneeId && !assigneeChanged && (reopened || (!skipAssigneeCommentWake && !dedupDecision.suppress))) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
@@ -2545,6 +2721,30 @@ export function issueRoutes(
       }
     }
 
+    const shouldCheckBlockedCommentDedup =
+      currentIssue.status === "blocked" &&
+      !!currentIssue.assigneeAgentId &&
+      !reopened;
+    let priorCommentsForWakeDedup: Array<{ id: string; body: string }> = [];
+    let blockedByForWakeDedup: Array<{
+      id: string;
+      identifier: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    }> = [];
+    if (shouldCheckBlockedCommentDedup) {
+      const [recentComments, relationSummary] = await Promise.all([
+        svc.listComments(id, { order: "desc", limit: 5 }),
+        svc.getRelationSummaries(id),
+      ]);
+      priorCommentsForWakeDedup = recentComments.map((existingComment) => ({
+        id: existingComment.id,
+        body: existingComment.body,
+      }));
+      blockedByForWakeDedup = relationSummary.blockedBy;
+    }
+
     const comment = await svc.addComment(id, req.body.body, {
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
@@ -2582,7 +2782,45 @@ export function issueRoutes(
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
       const skipWake = selfComment || isClosed;
-      if (assigneeId && (reopened || !skipWake)) {
+      const dedupDecision = !reopened
+        ? evaluateBlockedIssueCommentWakeDedup({
+          issueStatus: currentIssue.status,
+          issueId: currentIssue.id,
+          assigneeAgentId: assigneeId,
+          newCommentId: comment.id,
+          newCommentBody: req.body.body,
+          priorComments: priorCommentsForWakeDedup,
+          blockedBy: blockedByForWakeDedup,
+        })
+        : { checked: false, suppress: false as const };
+      if (dedupDecision.checked) {
+        logger.info(
+          {
+            issueId: dedupDecision.issueId,
+            assigneeAgentId: dedupDecision.assigneeAgentId,
+            reason: "issue_commented",
+            fingerprintHash: dedupDecision.fingerprintHash,
+            priorCommentId: dedupDecision.priorCommentId,
+            newCommentId: dedupDecision.newCommentId,
+            suppressed: dedupDecision.suppress,
+          },
+          "wake_comment_dedup_checked",
+        );
+      }
+      if (dedupDecision.suppress) {
+        logger.info(
+          {
+            issueId: dedupDecision.issueId,
+            assigneeAgentId: dedupDecision.assigneeAgentId,
+            reason: "issue_commented",
+            fingerprintHash: dedupDecision.fingerprintHash,
+            priorCommentId: dedupDecision.priorCommentId,
+            newCommentId: dedupDecision.newCommentId,
+          },
+          "wake_suppressed_duplicate_comment",
+        );
+      }
+      if (assigneeId && (reopened || (!skipWake && !dedupDecision.suppress))) {
         if (reopened) {
           wakeups.set(assigneeId, {
             source: "automation",
