@@ -5660,6 +5660,9 @@ export function heartbeatService(db: Db) {
         runId: mergedRun.id,
         finishedAt: new Date(),
       });
+      if (mergedRun.status === "queued") {
+        await startNextQueuedRunForAgent(agent.id);
+      }
       return mergedRun;
     }
 

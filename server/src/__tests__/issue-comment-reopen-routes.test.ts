@@ -7,6 +7,8 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
+  listComments: vi.fn(),
+  getRelationSummaries: vi.fn(),
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
@@ -56,6 +58,12 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 const mockRoutineService = vi.hoisted(() => ({
   syncRunStatusForIssue: vi.fn(async () => undefined),
 }));
+const mockLogger = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
 
 vi.mock("@paperclipai/shared/telemetry", () => ({
   trackAgentTaskCompleted: vi.fn(),
@@ -64,6 +72,10 @@ vi.mock("@paperclipai/shared/telemetry", () => ({
 
 vi.mock("../telemetry.js", () => ({
   getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
+}));
+
+vi.mock("../middleware/logger.js", () => ({
+  logger: mockLogger,
 }));
 
 vi.mock("../services/index.js", () => ({
@@ -173,6 +185,8 @@ describe("issue comment reopen routes", () => {
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.update.mockReset();
     mockIssueService.addComment.mockReset();
+    mockIssueService.listComments.mockReset();
+    mockIssueService.getRelationSummaries.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
@@ -191,6 +205,10 @@ describe("issue comment reopen routes", () => {
     mockInstanceSettingsService.get.mockReset();
     mockInstanceSettingsService.listCompanyIds.mockReset();
     mockRoutineService.syncRunStatusForIssue.mockReset();
+    mockLogger.info.mockReset();
+    mockLogger.warn.mockReset();
+    mockLogger.error.mockReset();
+    mockLogger.debug.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
     mockDb.transaction.mockReset();
@@ -228,6 +246,8 @@ describe("issue comment reopen routes", () => {
       authorAgentId: null,
       authorUserId: "local-board",
     });
+    mockIssueService.listComments.mockResolvedValue([]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
@@ -455,6 +475,219 @@ describe("issue comment reopen routes", () => {
           issueId: "11111111-1111-4111-8111-111111111111",
           mutation: "update",
         }),
+      }),
+    );
+  });
+
+  it("suppresses duplicate comment wakes on blocked issues when fingerprint and semantics match", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.listComments.mockResolvedValue([
+      {
+        id: "comment-prev-1",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+        body: "[WAITING-ON-HUMAN] Blocked on FMA-1209. Owner: Ops. Unblock: set DNS.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: null,
+        authorUserId: "local-board",
+      },
+    ]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          identifier: "FMA-1209",
+          title: "DNS pending",
+          status: "blocked",
+          priority: "high",
+          assigneeAgentId: "ops-agent",
+          assigneeUserId: null,
+          updatedAt: new Date("2000-01-01T00:00:00Z"),
+        },
+      ],
+      blocks: [],
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body:
+          "[WAITING-ON-HUMAN] Blocked on FMA-1209. Owner: Ops. Unblock: set DNS. 2026-05-14T10:22:00Z 123e4567-e89b-12d3-a456-426614174000",
+      });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueId: "11111111-1111-4111-8111-111111111111",
+        reason: "issue_commented",
+      }),
+      "wake_comment_dedup_checked",
+    );
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueId: "11111111-1111-4111-8111-111111111111",
+        reason: "issue_commented",
+      }),
+      "wake_suppressed_duplicate_comment",
+    );
+  });
+
+  it("keeps waking blocked assignees when blocker status context changes", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.listComments.mockResolvedValue([
+      {
+        id: "comment-prev-2",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+        body: "Blocked on FMA-1209. Owner Ops. Unblock pending.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: null,
+        authorUserId: "local-board",
+      },
+    ]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          identifier: "FMA-1209",
+          title: "DNS pending",
+          status: "done",
+          priority: "high",
+          assigneeAgentId: "ops-agent",
+          assigneeUserId: null,
+          updatedAt: new Date("2026-05-14T10:25:00Z"),
+        },
+      ],
+      blocks: [],
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body: "Blocked on FMA-1209 done now. Owner Ops. Unblock pending.",
+      });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          commentId: "comment-1",
+          mutation: "comment",
+        }),
+      }),
+    );
+  });
+
+  it("keeps waking when mirrored blocked comments arrive after blocker state changes", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.listComments.mockResolvedValue([
+      {
+        id: "comment-prev-5",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+        body: "[WAITING-ON-HUMAN] Blocked on FMA-1209. Owner: Ops. Unblock: set DNS.",
+        createdAt: new Date("2026-05-14T10:20:00Z"),
+        updatedAt: new Date("2026-05-14T10:20:00Z"),
+        authorAgentId: null,
+        authorUserId: "local-board",
+      },
+    ]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          identifier: "FMA-1209",
+          title: "DNS pending",
+          status: "done",
+          priority: "high",
+          assigneeAgentId: "ops-agent",
+          assigneeUserId: null,
+          updatedAt: new Date("2026-05-14T10:25:00Z"),
+        },
+      ],
+      blocks: [],
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body: "[WAITING-ON-HUMAN] Blocked on FMA-1209. Owner: Ops. Unblock: set DNS.",
+      });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_commented",
+      }),
+    );
+  });
+
+  it("keeps waking when new credential or access evidence appears in a blocked comment", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.listComments.mockResolvedValue([
+      {
+        id: "comment-prev-3",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+        body: "Blocked on FMA-1209. Owner Ops. Waiting on human.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: null,
+        authorUserId: "local-board",
+      },
+    ]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body: "Blocked on FMA-1209. Owner Ops. Waiting on human. Access token uploaded.",
+      });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_commented",
+      }),
+    );
+  });
+
+  it("preserves duplicate comment wake behavior for non-blocked issues", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockIssueService.listComments.mockResolvedValue([
+      {
+        id: "comment-prev-4",
+        issueId: "11111111-1111-4111-8111-111111111111",
+        companyId: "company-1",
+        body: "same update",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        authorAgentId: null,
+        authorUserId: "local-board",
+      },
+    ]);
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "same update" });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        reason: "issue_commented",
       }),
     );
   });
