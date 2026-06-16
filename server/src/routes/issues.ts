@@ -5258,9 +5258,13 @@ export function issueRoutes(
         };
       }
     }
+    const isTerminalRoutineExecution =
+      existing.workMode === "routine_execution" &&
+      (existing.status === "done" || existing.status === "cancelled");
     const reopened =
       commentBody &&
       effectiveMoveToTodoRequested &&
+      !isTerminalRoutineExecution &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers)) &&
       previous.status !== undefined &&
       issue.status === "todo";
@@ -6697,8 +6701,12 @@ export function issueRoutes(
 
     let scheduledRetrySupersededByComment = false;
     let cancelledScheduledRetryRunId: string | null = null;
+    const isTerminalRoutineExecution =
+      issue.workMode === "routine_execution" &&
+      (issue.status === "done" || issue.status === "cancelled");
     if (
       effectiveMoveToTodoRequested &&
+      !isTerminalRoutineExecution &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry)
     ) {
       scheduledRetrySupersededByComment = shouldResumeInProgressScheduledRetry && issue.status === "in_progress";
