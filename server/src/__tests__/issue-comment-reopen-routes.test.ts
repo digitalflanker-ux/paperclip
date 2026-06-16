@@ -195,7 +195,7 @@ async function normalizePolicy(input: {
   return normalizeIssueExecutionPolicy(input);
 }
 
-function makeIssue(status: "todo" | "done" | "blocked" | "cancelled" | "in_progress") {
+function makeIssue(status: "todo" | "done" | "blocked" | "cancelled" | "in_progress", workMode?: string) {
   return {
     id: "11111111-1111-4111-8111-111111111111",
     companyId: "company-1",
@@ -205,6 +205,7 @@ function makeIssue(status: "todo" | "done" | "blocked" | "cancelled" | "in_progr
     createdByUserId: "local-board",
     identifier: "PAP-580",
     title: "Comment reopen default",
+    ...(workMode ? { workMode } : {}),
   };
 }
 
@@ -2804,5 +2805,80 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  it("does not reopen completed routine_execution issues via POST comments", async () => {
+    const issue = makeIssue("done", "routine_execution");
+    const mockIssueService = createMockIssueService(issue);
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "human",
+        userId: "local-board",
+        companyId: "company-1",
+      }),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "This is a comment" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen completed routine_execution issues via PATCH comments", async () => {
+    const issue = makeIssue("done", "routine_execution");
+    const mockIssueService = createMockIssueService(issue);
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "human",
+        userId: "local-board",
+        companyId: "company-1",
+      }),
+    )
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "This is a comment" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen cancelled routine_execution issues via explicit reopen", async () => {
+    const issue = makeIssue("cancelled", "routine_execution");
+    const mockIssueService = createMockIssueService(issue);
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "human",
+        userId: "local-board",
+        companyId: "company-1",
+      }),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Reopening this", reopen: true });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("does reopen completed non-routine issues normally", async () => {
+    const issue = makeIssue("done");
+    const mockIssueService = createMockIssueService(issue);
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "human",
+        userId: "local-board",
+        companyId: "company-1",
+      }),
+    )
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "This should reopen the issue" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
   });
 });
