@@ -9794,9 +9794,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
+        // Routine execution issues do not reopen from completed states.
+        const isTerminalRoutineExecution =
+          issue.workMode === "routine_execution" &&
+          (issue.status === "done" || issue.status === "cancelled");
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
           !deferredCommentWakeIsSelfAuthored &&
+          !isTerminalRoutineExecution &&
           (issue.status === "done" || issue.status === "cancelled") &&
           (
             deferred.requestedByActorType === "user" ||
