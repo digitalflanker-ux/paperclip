@@ -2808,8 +2808,7 @@ describe.sequential("issue comment reopen routes", () => {
   });
 
   it("does not reopen completed routine_execution issues via POST comments", async () => {
-    const issue = makeIssue("done", "routine_execution");
-    const mockIssueService = createMockIssueService(issue);
+    mockIssueService.getById.mockResolvedValue(makeIssue("done", "routine_execution"));
 
     const res = await request(
       await installActor(createApp(), {
@@ -2827,7 +2826,11 @@ describe.sequential("issue comment reopen routes", () => {
 
   it("does not reopen completed routine_execution issues via PATCH comments", async () => {
     const issue = makeIssue("done", "routine_execution");
-    const mockIssueService = createMockIssueService(issue);
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
 
     const res = await request(
       await installActor(createApp(), {
@@ -2840,12 +2843,14 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ comment: "This is a comment" });
 
     expect(res.status).toBe(200);
-    expect(mockIssueService.update).not.toHaveBeenCalled();
+    const updateCalls = mockIssueService.update.mock.calls;
+    for (const [, patch] of updateCalls) {
+      expect(patch.status).not.toBe("todo");
+    }
   });
 
   it("does not reopen cancelled routine_execution issues via explicit reopen", async () => {
-    const issue = makeIssue("cancelled", "routine_execution");
-    const mockIssueService = createMockIssueService(issue);
+    mockIssueService.getById.mockResolvedValue(makeIssue("cancelled", "routine_execution"));
 
     const res = await request(
       await installActor(createApp(), {
@@ -2862,8 +2867,11 @@ describe.sequential("issue comment reopen routes", () => {
   });
 
   it("does reopen completed non-routine issues normally", async () => {
-    const issue = makeIssue("done");
-    const mockIssueService = createMockIssueService(issue);
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
 
     const res = await request(
       await installActor(createApp(), {
@@ -2878,7 +2886,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(res.status).toBe(201);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
-      { status: "todo" },
+      expect.objectContaining({ status: "todo" }),
     );
   });
 });

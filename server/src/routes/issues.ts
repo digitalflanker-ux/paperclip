@@ -4970,9 +4970,13 @@ export function issueRoutes(
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
     }
+    const isTerminalRoutineExecutionPatch =
+      existing.workMode === "routine_execution" &&
+      (existing.status === "done" || existing.status === "cancelled");
     if (
       commentBody &&
       effectiveMoveToTodoRequested &&
+      !isTerminalRoutineExecutionPatch &&
       (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry) &&
       updateFields.status === undefined
     ) {
