@@ -6,6 +6,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRuns,
   instanceUserRoles,
   issueComments,
   issues,
@@ -97,6 +98,28 @@ async function createIssue(
     .then((rows) => rows[0]!);
 }
 
+async function createHeartbeatRun(
+  db: ReturnType<typeof createDb>,
+  companyId: string,
+  agentId: string,
+  input: {
+    id?: string;
+    contextSnapshot?: Record<string, unknown> | null;
+  } = {},
+) {
+  return db
+    .insert(heartbeatRuns)
+    .values({
+      id: input.id ?? randomUUID(),
+      companyId,
+      agentId,
+      contextSnapshot: input.contextSnapshot ?? null,
+      status: "running",
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+}
+
 async function grantAgentPermission(
   db: ReturnType<typeof createDb>,
   companyId: string,
@@ -173,6 +196,7 @@ describeEmbeddedPostgres("authorization service", () => {
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(heartbeatRuns);
     await db.delete(userInboxAgentPolicies);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
@@ -1131,6 +1155,86 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({
       allowed: false,
       reason: "deny_unsupported_action",
+    });
+  });
+
+  it("ignores malformed run ids on issue mutations instead of throwing", async () => {
+    const company = await createCompany(db, "InvalidRunIdIgnored");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Invalid run id mutation",
+      assigneeAgentId: actorAgent.id,
+    });
+
+    await expect(authorizationService(db).decide({
+      actor: {
+        type: "agent",
+        agentId: actorAgent.id,
+        companyId: company.id,
+        runId: "not-a-uuid",
+        source: "agent_key",
+      },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        assigneeAgentId: actorAgent.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_self",
+    });
+  });
+
+  it("still honors valid run-backed policy on issue comments", async () => {
+    const company = await createCompany(db, "ValidRunPolicy");
+    const ownerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const actorAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+      },
+    });
+    const project = await createProject(db, company.id, "RunAllowed");
+    const issue = await createIssue(db, company.id, {
+      title: "Run policy mutation",
+      projectId: project.id,
+      assigneeAgentId: ownerAgent.id,
+    });
+    const run = await createHeartbeatRun(db, company.id, actorAgent.id, {
+      contextSnapshot: {
+        executionPolicy: {
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [project.id],
+            },
+          },
+        },
+      },
+    });
+
+    await expect(authorizationService(db).decide({
+      actor: {
+        type: "agent",
+        agentId: actorAgent.id,
+        companyId: company.id,
+        runId: run.id,
+        source: "agent_key",
+      },
+      action: "issue:comment",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        assigneeAgentId: ownerAgent.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_low_trust_boundary",
     });
   });
 

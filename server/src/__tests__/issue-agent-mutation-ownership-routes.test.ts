@@ -2,6 +2,8 @@ import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import { authorizationService } from "../services/authorization.js";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -284,6 +286,77 @@ function createRunContextDb(
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
+  };
+  const buildQuery = (selection: Record<string, unknown>) => {
+    const whereResult = {
+      orderBy: vi.fn(async () => []),
+      then: async (resolve: (rows: unknown[]) => unknown) => resolve(rowsForSelection(selection)),
+    };
+    const query = {
+      innerJoin: vi.fn(() => query),
+      where: vi.fn(() => whereResult),
+    };
+    return query;
+  };
+  return {
+    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+    select: vi.fn((selection: Record<string, unknown> = {}) => ({
+      from: vi.fn(() => buildQuery(selection)),
+    })),
+  };
+}
+
+function createAuthorizationRouteDb(input: {
+  actorAgent?: Record<string, unknown>;
+  issue?: Record<string, unknown>;
+  project?: Record<string, unknown> | null;
+  runRows?: Record<string, unknown>[];
+  onRunLookup?: () => void;
+}) {
+  const actorAgent = {
+    id: ownerAgentId,
+    companyId,
+    role: "engineer",
+    status: "active",
+    reportsTo: null,
+    permissions: {},
+    ...input.actorAgent,
+  };
+  const issue = {
+    id: issueId,
+    companyId,
+    projectId: null,
+    parentId: null,
+    assigneeAgentId: ownerAgentId,
+    assigneeUserId: null,
+    status: "in_progress",
+    executionPolicy: null,
+    originKind: "manual",
+    originId: null,
+    ...input.issue,
+  };
+  const project = input.project ?? null;
+  const runRows = input.runRows ?? [];
+  const rowsForSelection = (selection: Record<string, unknown>) => {
+    const keys = Object.keys(selection);
+    if (keys.includes("contextSnapshot")) {
+      input.onRunLookup?.();
+      return runRows;
+    }
+    if (keys.includes("executionWorkspacePolicy")) {
+      return project ? [project] : [];
+    }
+    if (
+      keys.includes("executionPolicy") &&
+      keys.includes("assigneeAgentId") &&
+      keys.includes("originKind")
+    ) {
+      return [issue];
+    }
+    if (keys.includes("permissions") && keys.includes("reportsTo")) {
+      return [actorAgent];
+    }
+    return [];
   };
   const buildQuery = (selection: Record<string, unknown>) => {
     const whereResult = {
@@ -969,6 +1042,109 @@ describe("agent issue mutation checkout ownership", () => {
         createdByRunId: ownerRunId,
         lockedDocumentStrategy: "create_new_document",
       }),
+    );
+  });
+
+  it("returns the normal boundary denial instead of 500 when the authenticated mutation path gets a malformed run id", async () => {
+    const projectId = "12121212-1212-4212-8212-121212121212";
+    const authzDb = createAuthorizationRouteDb({
+      actorAgent: {
+        id: peerAgentId,
+        companyId,
+        role: "engineer",
+        status: "active",
+        permissions: { trustPreset: LOW_TRUST_REVIEW_PRESET },
+      },
+      issue: {
+        id: issueId,
+        companyId,
+        projectId,
+        assigneeAgentId: ownerAgentId,
+      },
+      project: {
+        executionWorkspacePolicy: null,
+      },
+      runRows: [{
+        id: "66666666-6666-4666-8666-666666666666",
+        companyId,
+        agentId: peerAgentId,
+        contextSnapshot: {
+          executionPolicy: {
+            authorizationPolicy: {
+              trustBoundary: {
+                mode: LOW_TRUST_REVIEW_PRESET,
+                companyId,
+                projectIds: [projectId],
+              },
+            },
+          },
+        },
+      }],
+    });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ projectId, assigneeAgentId: ownerAgentId }));
+    mockAccessService.decide.mockImplementation(async (input) => authorizationService(authzDb as any).decide(input as any));
+
+    const res = await request(await createApp(peerActor({
+      runId: "not-a-uuid",
+    }), authzDb))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Malformed run id should not crash authz." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("still honors valid run-backed policy on the authenticated comment mutation path", async () => {
+    const projectId = "13131313-1313-4313-8313-131313131313";
+    const authzDb = createAuthorizationRouteDb({
+      actorAgent: {
+        id: peerAgentId,
+        companyId,
+        role: "engineer",
+        status: "active",
+        permissions: { trustPreset: LOW_TRUST_REVIEW_PRESET },
+      },
+      issue: {
+        id: issueId,
+        companyId,
+        projectId,
+        assigneeAgentId: ownerAgentId,
+      },
+      project: {
+        executionWorkspacePolicy: null,
+      },
+      runRows: [{
+        id: "66666666-6666-4666-8666-666666666666",
+        companyId,
+        agentId: peerAgentId,
+        contextSnapshot: {
+          executionPolicy: {
+            authorizationPolicy: {
+              trustBoundary: {
+                mode: LOW_TRUST_REVIEW_PRESET,
+                companyId,
+                projectIds: [projectId],
+              },
+            },
+          },
+        },
+      }],
+    });
+    mockIssueService.getById.mockResolvedValue(makeIssue({ projectId, assigneeAgentId: ownerAgentId }));
+    mockAccessService.decide.mockImplementation(async (input) => authorizationService(authzDb as any).decide(input as any));
+
+    const actor = peerActor();
+    const res = await request(await createApp(actor, authzDb))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Valid run id should preserve run-backed policy." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Valid run id should preserve run-backed policy.",
+      expect.objectContaining({ runId: actor.runId }),
+      expect.any(Object),
     );
   });
 
